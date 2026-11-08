@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JSONBin Sync</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 "Meiryo", system-ui, sans-serif; max-width: 480px; margin: 16px auto; padding: 0 12px; }
+  .row { display: flex; gap: 8px; margin: 8px 0; align-items: center; }
+  select { flex: 1; padding: 4px; font: inherit; }
+  button { padding: 6px 10px; font: inherit; cursor: pointer; }
+  .row.main button { flex: 1; }
+  #info { margin: 0 0 8px; }
+  #log { height: 180px; overflow-y: auto; white-space: pre-wrap; border: 1px solid #8886; padding: 6px; margin: 8px 0; font-size: 12px; }
+  .spacer { flex: 1; }
+  #hint { font-size: 12px; opacity: .7; }
+</style>
+</head>
+<body>
+  <div class="row">
+    <label for="sel">接続先</label>
+    <select id="sel" disabled></select>
+  </div>
+  <p id="info"></p>
+  <div class="row main">
+    <button id="btnUp" disabled>アップロード</button>
+    <button id="btnDown" disabled>ダウンロード</button>
+  </div>
+  <div id="log"></div>
+  <div class="row">
+    <button id="btnLoad">設定を読み込む</button>
+    <button id="btnForget">設定を消去</button>
+    <span class="spacer"></span>
+    <button id="btnSaveLog">ログを保存</button>
+    <button id="btnClear">クリア</button>
+  </div>
+  <div id="hint">config.json は画面へドラッグ&amp;ドロップでも読み込めます。設定はこのブラウザ内にのみ保存されます。</div>
+  <input type="file" id="fileUp" accept=".json,application/json" hidden>
+  <input type="file" id="fileCfg" accept=".json,application/json" hidden>
+
+<script>
+const STORE = "jsonbin_sync_config";
+const API = "https://api.jsonbin.io/v3/b";
+const $ = id => document.getElementById(id);
+let config = null, busy = false;
+
+const p2 = n => String(n).padStart(2, "0");
+function fmt(d) { return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`; }
+function stamp() { const d = new Date(); return `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`; }
+function ago(ms) {
+  const s = Math.floor((Date.now() - ms) / 1000);
+  if (s >= 86400) return `${Math.floor(s / 86400)}日前`;
+  if (s >= 3600) return `${Math.floor(s / 3600)}時間前`;
+  if (s >= 60) return `${Math.floor(s / 60)}分前`;
+  return "たった今";
+}
+const tail = v => "…" + String(v).trim().slice(-4);
+const safeName = n => n.replace(/[\\/:*?"<>|\s]+/g, "_");
+
+function log(t) {
+  const d = new Date(), l = $("log");
+  l.textContent += `[${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}] ${t}\n`;
+  l.scrollTop = l.scrollHeight;
+}
+
+function validate(c) {
+  if (!c || !Array.isArray(c.bins) || !c.bins.length) throw new Error('"bins" に1件以上の設定が必要です');
+  c.bins.forEach((b, i) => {
+    for (const k of ["name", "master_key", "bin_id"])
+      if (!String(b[k] ?? "").trim()) throw new Error(`bins の ${i + 1} 件目に "${k}" がありません`);
+  });
+  return c;
+}
+
+function store() {
+  try { localStorage.setItem(STORE, JSON.stringify(config)); }
+  catch (e) { log("ブラウザへの保存に失敗: " + e.message); }
+}
+
+function cur() { return config && config.bins.find(b => b.name === $("sel").value); }
+
+function updateInfo() {
+  const b = cur();
+  $("info").textContent = b ? `Bin ID ${tail(b.bin_id)}  /  Key ${tail(b.master_key)}` : "";
+}
+
+function setButtons() {
+  const on = !!config && !busy;
+  $("btnUp").disabled = $("btnDown").disabled = $("sel").disabled = !on;
+}
+
+function apply(c, keep) {
+  config = c;
+  const names = c.bins.map(b => b.name), sel = $("sel");
+  sel.innerHTML = "";
+  names.forEach(n => sel.add(new Option(n, n)));
+  sel.value = names.includes(keep) ? keep : (names.includes(c.selected) ? c.selected : names[0]);
+  updateInfo();
+  setButtons();
+}
+
+async function loadConfigFile(file) {
+  try {
+    const c = validate(JSON.parse(await file.text()));
+    apply(c, config && $("sel").value);
+    config.selected = $("sel").value;
+    store();
+    log(`${file.name} を読み込みました (${c.bins.length} 件の接続先)`);
+  } catch (e) {
+    log("設定の読み込みエラー: " + e.message);
+  }
+}
+
+async function run(fn) {
+  busy = true; setButtons();
+  try { await fn(); }
+  catch (e) { log("エラー: " + e.message); }
+  finally { busy = false; setButtons(); }
+}
+
+function saveBlob(text, name, type) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+async function upload(file) {
+  const b = cur();
+  let data;
+  try { data = JSON.parse(await file.text()); }
+  catch (e) { log("JSONとして読めません: " + e.message); return; }
+  const ok = confirm(
+    `接続先 [${b.name}] を上書きします。\nこの操作は取り消せません。\n\n` +
+    `ファイル名: ${file.name}\n最終更新: ${fmt(new Date(file.lastModified))} (${ago(file.lastModified)})\n\nアップロードしますか?`);
+  if (!ok) { log("アップロードをキャンセルしました"); return; }
+  await run(async () => {
+    log(`[${b.name}] アップロード中... (${file.name})`);
+    const r = await fetch(`${API}/${b.bin_id.trim()}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", "X-Master-Key": b.master_key.trim() },
+      body: JSON.stringify(data),
+    });
+    if (!r.ok) throw new Error(`HTTPエラー: ${r.status} ${r.statusText}`);
+    log(`完了: アップロードしました (${file.name})`);
+  });
+}
+
+async function download() {
+  const b = cur();
+  await run(async () => {
+    log(`[${b.name}] ダウンロード中...`);
+    const r = await fetch(`${API}/${b.bin_id.trim()}/latest`, { headers: { "X-Master-Key": b.master_key.trim() } });
+    if (!r.ok) throw new Error(`HTTPエラー: ${r.status} ${r.statusText}`);
+    const body = await r.json();
+    const name = `data_${safeName(b.name)}_${stamp()}.json`;
+    saveBlob(JSON.stringify(body.record ?? body, null, 2), name, "application/json");
+    log(`完了: ${name} をダウンロードしました`);
+  });
+}
+
+$("sel").onchange = () => { updateInfo(); config.selected = $("sel").value; store(); };
+$("btnUp").onclick = () => $("fileUp").click();
+$("fileUp").onchange = e => { const f = e.target.files[0]; e.target.value = ""; if (f) upload(f); };
+$("btnDown").onclick = download;
+$("btnLoad").onclick = () => $("fileCfg").click();
+$("fileCfg").onchange = e => { const f = e.target.files[0]; e.target.value = ""; if (f) loadConfigFile(f); };
+$("btnForget").onclick = () => {
+  if (!confirm("このブラウザに保存した設定(Master Key含む)を消去しますか?")) return;
+  try { localStorage.removeItem(STORE); } catch (e) {}
+  config = null; $("sel").innerHTML = ""; updateInfo(); setButtons();
+  log("保存した設定を消去しました");
+};
+$("btnClear").onclick = () => { $("log").textContent = ""; };
+$("btnSaveLog").onclick = () => {
+  const t = $("log").textContent.trim();
+  if (!t) { alert("保存するログがありません。"); return; }
+  saveBlob(t + "\n", `log_${stamp()}.txt`, "text/plain");
+};
+
+addEventListener("dragover", e => e.preventDefault());
+addEventListener("drop", e => {
+  e.preventDefault();
+  const f = e.dataTransfer.files[0];
+  if (f) loadConfigFile(f);
+});
+
+(function init() {
+  try {
+    const raw = localStorage.getItem(STORE);
+    if (raw) {
+      apply(validate(JSON.parse(raw)), null);
+      log(`準備完了 (${config.bins.length} 件の接続先)`);
+      return;
+    }
+  } catch (e) { log("保存された設定を読めません: " + e.message); }
+  log("config.json を読み込んでください");
+})();
+</script>
+</body>
+</html>
