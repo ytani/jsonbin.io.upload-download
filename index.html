@@ -12,7 +12,10 @@
   button { padding: 6px 10px; font: inherit; cursor: pointer; }
   .row.main button { flex: 1; }
   #info { margin: 0 0 8px; }
-  #log { height: 180px; overflow-y: auto; white-space: pre-wrap; border: 1px solid #8886; padding: 6px; margin: 8px 0; font-size: 12px; }
+  #log { height: 110px; overflow-y: auto; white-space: pre-wrap; border: 1px solid #8886; padding: 6px; margin: 8px 0; font-size: 12px; }
+  textarea { width: 100%; box-sizing: border-box; height: 120px; font: 12px/1.4 Consolas, monospace; padding: 6px; }
+  #status { min-height: 1.5em; font-size: 12px; margin: 4px 0; }
+  #status.err { font-weight: bold; }
   .spacer { flex: 1; }
   #hint { font-size: 12px; opacity: .7; }
 </style>
@@ -24,8 +27,15 @@
   </div>
   <p id="info"></p>
   <div class="row main">
-    <button id="btnUp" disabled>アップロード</button>
-    <button id="btnDown" disabled>ダウンロード</button>
+    <button id="btnUp" disabled>ファイルをアップロード</button>
+    <button id="btnDown" disabled>ファイルでダウンロード</button>
+  </div>
+  <textarea id="txt" spellcheck="false" placeholder="JSONテキストを貼り付け / 取得した内容がここに表示されます"></textarea>
+  <div id="status"></div>
+  <div class="row main">
+    <button id="btnTxtUp" disabled>テキストをアップロード</button>
+    <button id="btnTxtGet" disabled>テキストで取得</button>
+    <button id="btnCopy" disabled>コピー</button>
   </div>
   <div id="log"></div>
   <div class="row">
@@ -43,7 +53,7 @@
 const STORE = "jsonbin_sync_config";
 const API = "https://api.jsonbin.io/v3/b";
 const $ = id => document.getElementById(id);
-let config = null, busy = false;
+let config = null, busy = false, textState = { state: "empty" };
 
 const p2 = n => String(n).padStart(2, "0");
 function fmt(d) { return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`; }
@@ -88,6 +98,9 @@ function updateInfo() {
 function setButtons() {
   const on = !!config && !busy;
   $("btnUp").disabled = $("btnDown").disabled = $("sel").disabled = !on;
+  $("btnTxtGet").disabled = !on;
+  $("btnTxtUp").disabled = !on || textState.state !== "ok";
+  $("btnCopy").disabled = textState.state !== "ok";
 }
 
 function apply(c, keep) {
@@ -127,44 +140,118 @@ function saveBlob(text, name, type) {
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
-async function upload(file) {
-  const b = cur();
-  let data;
-  try { data = JSON.parse(await file.text()); }
-  catch (e) { log("JSONとして読めません: " + e.message); return; }
-  const ok = confirm(
-    `接続先 [${b.name}] を上書きします。\nこの操作は取り消せません。\n\n` +
-    `ファイル名: ${file.name}\n最終更新: ${fmt(new Date(file.lastModified))} (${ago(file.lastModified)})\n\nアップロードしますか?`);
-  if (!ok) { log("アップロードをキャンセルしました"); return; }
+function jsonErr(t, e) {
+  const m = String(e.message);
+  let loc = m.match(/line (\d+) column (\d+)/);
+  if (loc) return `${loc[1]}行 ${loc[2]}列付近 (${m})`;
+  loc = m.match(/position (\d+)/);
+  if (loc) {
+    const before = t.slice(0, +loc[1]);
+    return `${before.split("\n").length}行 ${before.length - before.lastIndexOf("\n")}列付近 (${m})`;
+  }
+  return m;
+}
+
+function summary(d) {
+  if (Array.isArray(d)) return `配列 ${d.length}件`;
+  if (d && typeof d === "object") return `オブジェクト ${Object.keys(d).length}キー`;
+  return "単一の値";
+}
+
+function onText() {
+  const t = $("txt").value, s = $("status");
+  if (!t.trim()) textState = { state: "empty" };
+  else {
+    try { textState = { state: "ok", data: JSON.parse(t) }; }
+    catch (e) { textState = { state: "error", msg: jsonErr(t, e) }; }
+  }
+  s.className = textState.state === "error" ? "err" : "";
+  s.textContent = textState.state === "ok" ? `構文: OK (${summary(textState.data)})`
+    : textState.state === "error" ? `構文エラー: ${textState.msg}` : "";
+  setButtons();
+}
+
+async function putBin(b, data, label) {
   await run(async () => {
-    log(`[${b.name}] アップロード中... (${file.name})`);
+    log(`[${b.name}] アップロード中... (${label})`);
     const r = await fetch(`${API}/${b.bin_id.trim()}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json", "X-Master-Key": b.master_key.trim() },
       body: JSON.stringify(data),
     });
     if (!r.ok) throw new Error(`HTTPエラー: ${r.status} ${r.statusText}`);
-    log(`完了: アップロードしました (${file.name})`);
+    log(`完了: アップロードしました (${label})`);
   });
+}
+
+async function upload(file) {
+  const b = cur(), t = await file.text();
+  let data;
+  try { data = JSON.parse(t); }
+  catch (e) { log(`構文エラーのためアップロードできません (${file.name}): ${jsonErr(t, e)}`); return; }
+  const ok = confirm(
+    `接続先 [${b.name}] を上書きします。\nこの操作は取り消せません。\n\n` +
+    `ファイル名: ${file.name}\n最終更新: ${fmt(new Date(file.lastModified))} (${ago(file.lastModified)})\n\nアップロードしますか?`);
+  if (!ok) { log("アップロードをキャンセルしました"); return; }
+  await putBin(b, data, file.name);
+}
+
+async function uploadText() {
+  if (textState.state !== "ok") { log("構文エラーまたは空のため、アップロードできません"); return; }
+  const b = cur(), t = $("txt").value, head = t.trim().replace(/\s+/g, " ");
+  const ok = confirm(
+    `接続先 [${b.name}] を上書きします。\nこの操作は取り消せません。\n\n` +
+    `内容: ${summary(textState.data)} (${t.length}文字)\n先頭: ${head.length > 60 ? head.slice(0, 60) + "…" : head}\n\nアップロードしますか?`);
+  if (!ok) { log("アップロードをキャンセルしました"); return; }
+  await putBin(b, textState.data, "テキスト");
+}
+
+async function fetchRecord(b) {
+  const r = await fetch(`${API}/${b.bin_id.trim()}/latest`, { headers: { "X-Master-Key": b.master_key.trim() } });
+  if (!r.ok) throw new Error(`HTTPエラー: ${r.status} ${r.statusText}`);
+  let body;
+  try { body = await r.json(); }
+  catch (e) { throw new Error("取得した内容がJSONとして読めないため、中止しました"); }
+  return body.record ?? body;
 }
 
 async function download() {
   const b = cur();
   await run(async () => {
     log(`[${b.name}] ダウンロード中...`);
-    const r = await fetch(`${API}/${b.bin_id.trim()}/latest`, { headers: { "X-Master-Key": b.master_key.trim() } });
-    if (!r.ok) throw new Error(`HTTPエラー: ${r.status} ${r.statusText}`);
-    const body = await r.json();
+    const rec = await fetchRecord(b);
     const name = `data_${safeName(b.name)}_${stamp()}.json`;
-    saveBlob(JSON.stringify(body.record ?? body, null, 2), name, "application/json");
+    saveBlob(JSON.stringify(rec, null, 2), name, "application/json");
     log(`完了: ${name} をダウンロードしました`);
   });
+}
+
+async function downloadText() {
+  const b = cur();
+  await run(async () => {
+    log(`[${b.name}] 取得中...`);
+    $("txt").value = JSON.stringify(await fetchRecord(b), null, 2);
+    onText();
+    log("完了: テキスト欄に取得しました");
+  });
+}
+
+async function copyText() {
+  try { await navigator.clipboard.writeText($("txt").value); log("テキストをクリップボードにコピーしました"); }
+  catch (e) {
+    $("txt").select();
+    log(document.execCommand("copy") ? "テキストをクリップボードにコピーしました" : "コピーに失敗しました");
+  }
 }
 
 $("sel").onchange = () => { updateInfo(); config.selected = $("sel").value; store(); };
 $("btnUp").onclick = () => $("fileUp").click();
 $("fileUp").onchange = e => { const f = e.target.files[0]; e.target.value = ""; if (f) upload(f); };
 $("btnDown").onclick = download;
+$("txt").oninput = onText;
+$("btnTxtUp").onclick = uploadText;
+$("btnTxtGet").onclick = downloadText;
+$("btnCopy").onclick = copyText;
 $("btnLoad").onclick = () => $("fileCfg").click();
 $("fileCfg").onchange = e => { const f = e.target.files[0]; e.target.value = ""; if (f) loadConfigFile(f); };
 $("btnForget").onclick = () => {
